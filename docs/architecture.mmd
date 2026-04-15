@@ -1,0 +1,64 @@
+%%{init: {
+  "theme": "dark",
+  "themeVariables": {
+    "background": "#0a0e1a",
+    "primaryColor": "#1a2035",
+    "primaryTextColor": "#e2e8f0",
+    "primaryBorderColor": "#00d4aa",
+    "lineColor": "#94a3b8",
+    "secondaryColor": "#151929",
+    "tertiaryColor": "#131824",
+    "clusterBkg": "#0f1625",
+    "clusterBorder": "#1e3a5f",
+    "edgeLabelBackground": "#0d1424",
+    "fontFamily": "Segoe UI, system-ui, sans-serif",
+    "fontSize": "14px"
+  }
+}}%%
+
+flowchart LR
+
+    subgraph SRC ["DATA SOURCE"]
+        API["Frankfurter API\napi.frankfurter.app\nGET /latest?from=USD"]
+    end
+
+    subgraph NIFI ["APACHE NIFI  --  INGESTION AND TRANSFORM LAYER"]
+        direction LR
+        P1["1 - InvokeHTTP\nHTTPS GET every 60s\nResponse to FlowFile"]
+        P2["2 - JoltTransformJSON\nPivot nested rates map\nto array of row objects"]
+        P3["3 - SplitJson\n1 FlowFile per\ncurrency pair  $.* "]
+        P4["4 - EvaluateJsonPath\nExtract attributes:\nbase, target, date, rate"]
+        CACHE[("DistributedMapCache\nIn-memory KV state")]
+        P5["5 - DetectDuplicate\nCache key:\nbase_target_date_rate"]
+        DROP{{"DUPLICATE\nAuto-Terminated"}}
+        P6["6 - PutDatabaseRecord\nINSERT into fx_rates"]
+
+        P1 --> |"Raw JSON"| P2
+        P2 --> |"Array of objects"| P3
+        P3 --> |"Individual FlowFile"| P4
+        P4 --> |"FF + attributes"| P5
+        CACHE -. "Cache lookup" .-> P5
+        P5 --> |"Duplicate"| DROP
+        P5 --> |"Unique record"| P6
+    end
+
+    subgraph DEST ["DESTINATION  --  PostgreSQL"]
+        DB[("postgres_fx  port 5432\nDatabase: fx_db\nTable: fx_rates\nPK: base + target + date")]
+    end
+
+    API --> |"HTTPS GET\nevery 1 min"| P1
+    P6 --> |"INSERT"| DB
+
+    style SRC fill:#091a14,stroke:#00d4aa,stroke-width:2px,color:#00d4aa
+    style NIFI fill:#0b1420,stroke:#72b043,stroke-width:2px,color:#72b043
+    style DEST fill:#091222,stroke:#336791,stroke-width:2px,color:#6ea8d4
+    style API fill:#0d2218,stroke:#00d4aa,stroke-width:2px,color:#b2fce4
+    style P1 fill:#1a2a45,stroke:#3b82f6,stroke-width:2px,color:#93c5fd
+    style P2 fill:#2a1f0a,stroke:#f59e0b,stroke-width:2px,color:#fcd34d
+    style P3 fill:#1f1040,stroke:#a78bfa,stroke-width:2px,color:#c4b5fd
+    style P4 fill:#072a30,stroke:#06b6d4,stroke-width:2px,color:#67e8f9
+    style P5 fill:#1e0d40,stroke:#8b5cf6,stroke-width:2px,color:#c4b5fd
+    style P6 fill:#0a2a10,stroke:#22c55e,stroke-width:2px,color:#86efac
+    style CACHE fill:#2a1a00,stroke:#f5a623,stroke-width:2px,color:#fcd34d
+    style DROP fill:#2a0a0a,stroke:#ef4444,stroke-width:2px,color:#fca5a5
+    style DB fill:#0d1f38,stroke:#336791,stroke-width:2px,color:#93c5fd
