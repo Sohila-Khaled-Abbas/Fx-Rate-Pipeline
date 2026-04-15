@@ -172,139 +172,163 @@ CREATE TABLE fx_rates (
 
 ## 4. Step-by-Step NiFi Implementation
 
+### Step 4.0: Prerequisite - Injecting the JDBC Driver
+
+NiFi does not ship with the PostgreSQL driver by default. You must download it into the running container before configuring the connection pool. Open your host terminal and run:
+
+```bash
+docker exec -it nifi_fx wget https://jdbc.postgresql.org/download/postgresql-42.7.3.jar -P /tmp/
+```
+
 ### Step 4.1: Controller Services Setup
 
-Navigate to: **NiFi Canvas → Gear Icon (top-right) → Controller Services tab**
+NiFi relies on background services for connections, parsing, and state. Right-click anywhere on the blank NiFi canvas and select **Configure**. Navigate to the **Controller Services** tab. Click the `+` icon to add a new service. Search for and add each of the following:
 
 #### DBCPConnectionPool
+
+Click the gear icon to configure. Go to the **Properties** tab.
 
 | Property | Value |
 | :--- | :--- |
 | **Database Connection URL** | `jdbc:postgresql://postgres_fx:5432/fx_db` |
 | **Database Driver Class Name** | `org.postgresql.Driver` |
+| **Database Driver Location(s)** | `/tmp/postgresql-42.7.3.jar` |
 | **Database User** | `nifi_user` |
 | **Password** | `nifi_password` |
 
-> **📝 NOTE:**
-> The hostname in the JDBC URL is `postgres_fx` — the Docker container name — **not** `localhost`. NiFi itself runs inside a container, so `localhost` would refer to the NiFi container, not PostgreSQL.
+Click **Apply**. Click the lightning bolt icon to **Enable** it.
+
+#### JsonTreeReader
+
+Click the gear icon. Leave all default properties (it will infer the schema automatically). Click **Apply**. Click the lightning bolt icon to **Enable** it.
 
 #### DistributedMapCacheServer
 
-| Property | Value |
-| :--- | :--- |
-| **Port** | `4557` (default) |
-
-*(Enable it. No further configuration needed for local use).*
+Click the gear icon. Leave defaults (Port `4557`). Click **Apply**. Click the lightning bolt icon to **Enable** it.
 
 #### DistributedMapCacheClientService
+
+Click the gear icon. Go to the **Properties** tab.
 
 | Property | Value |
 | :--- | :--- |
 | **Server Hostname** | `localhost` |
-| **Server Port** | `4557` |
 
-> **📝 NOTE:**
-> Here, `localhost` **is** correct — both the client and server are running inside the same NiFi JVM process.
+Click **Apply**. Click the lightning bolt icon to **Enable** it.
 
 ---
 
-### Step 4.2: Data Ingestion — InvokeHTTP
+### Step 4.2: Data Ingestion (InvokeHTTP)
 
-| Property | Value |
-| :--- | :--- |
-| **HTTP Method** | `GET` |
-| **Remote URL** | `https://api.frankfurter.app/latest?from=USD` |
-| **Run Schedule** | `1 min` |
+Drag the Processor icon from the top menu onto the canvas. Search for `InvokeHTTP`. Right-click the processor -> **Configure**.
 
-**Connections:** `Response` → `JoltTransformJSON`
+- **Properties Tab:**
+  - **HTTP Method**: `GET`
+  - **Remote URL**: `https://api.frankfurter.app/latest?from=USD`
+- **Scheduling Tab:**
+  - **Run Schedule**: `1 min`
+- **Relationships Tab:**
+  - Check the boxes to Auto-terminate **Failure**, **No Retry**, **Original**, **Retry**. (We only care about the Response).
+
+Click **Apply**.
 
 ---
 
-### Step 4.3: The Brittle Transformation — JoltTransformJSON
+### Step 4.3: The Brittle Transformation (JoltTransformJSON)
 
-**The problem:** We need to pivot a dynamic JSON map (`"EUR": 0.95`) into an array of objects. 
+Drag a `JoltTransformJSON` processor onto the canvas. Hover over `InvokeHTTP`. A green arrow will appear. Drag it to `JoltTransformJSON`. Select the **Response** relationship for this connection. Right-click `JoltTransformJSON` -> **Configure**.
 
-| Property | Value |
-| :--- | :--- |
-| **Jolt Transform** | `jolt-transform-shift` |
-
-**Jolt Specification:**
-```json
-[
-  {
-    "operation": "shift",
-    "spec": {
-      "rates": {
-        "*": {
-          "$":        "[#2].target_currency",
-          "@":        "[#2].exchange_rate",
-          "@(2,base)": "[#2].base_currency",
-          "@(2,date)": "[#2].rate_date"
+- **Properties Tab:**
+  - **Jolt Transform**: `jolt-transform-shift`
+  - **Jolt Specification**: *(Paste the exact JSON below)*
+    ```json
+    [
+      {
+        "operation": "shift",
+        "spec": {
+          "rates": {
+            "*": {
+              "$": "[#2].target_currency",
+              "@": "[#2].exchange_rate",
+              "@(2,base)": "[#2].base_currency",
+              "@(2,date)": "[#2].rate_date"
+            }
+          }
         }
       }
-    }
-  }
-]
-```
+    ]
+    ```
+- **Relationships Tab:**
+  - Auto-terminate **Failure**.
 
-**Connections:** `success` → `SplitJson`
-
----
-
-### Step 4.4: Record Splitting — SplitJson
-
-The Jolt output is an array. We need individual FlowFiles.
-
-| Property | Value |
-| :--- | :--- |
-| **JsonPath Expression** | `$.*` |
-
-**Connections:** `split` → `EvaluateJsonPath`
+Click **Apply**.
 
 ---
 
-### Step 4.5: State Management — Delta Detection
+### Step 4.4: Record Splitting (SplitJson)
 
-This prevents NiFi from inserting the exact same data every 60 seconds.
+The JOLT output is a single array. We must break it into individual FlowFiles to check for duplicates on a per-currency basis. Drag a `SplitJson` processor onto the canvas. Connect `JoltTransformJSON` -> `SplitJson`. Select the **Success** relationship. Right-click `SplitJson` -> **Configure**.
 
-#### Processor 1 — EvaluateJsonPath
+- **Properties Tab:**
+  - **JsonPath Expression**: `$.*`
+- **Relationships Tab:**
+  - Auto-terminate **Failure** and **Original**. (We only want the `split` outputs).
 
-| Destination | Value |
-| :--- | :--- |
-| **Destination** | `flowfile-attribute` |
-
-*(Add custom properties via the **`+` button**):*
-- `base`: `$.base_currency`
-- `target`: `$.target_currency`
-- `date`: `$.rate_date`
-- `rate`: `$.exchange_rate`
-
-**Connections:** `matched` → `DetectDuplicate`
-
-#### Processor 2 — DetectDuplicate
-
-| Property | Value |
-| :--- | :--- |
-| **Cache Entry Identifier** | `${base}_${target}_${date}_${rate}` |
-| **Distributed Cache Service** | `DistributedMapCacheClientService` |
-
-> **❗ IMPORTANT:**
-> You **must** route the `duplicate` relationship to Auto-terminate. This is the path where redundant data is silently discarded before it hits the database.
-
-**Connections:** `non-duplicate` → `PutDatabaseRecord`, `duplicate` → Auto-terminate
+Click **Apply**.
 
 ---
 
-### Step 4.6: Database Load — PutDatabaseRecord
+### Step 4.5: Attribute Extraction (EvaluateJsonPath)
 
-| Property | Value |
-| :--- | :--- |
-| **Record Reader** | `JsonTreeReader` *(create and enable this service)* |
-| **Statement Type** | `INSERT` |
-| **Database Connection Pooling** | `DBCPConnectionPool` |
-| **Table Name** | `fx_rates` |
+Drag an `EvaluateJsonPath` processor onto the canvas. Connect `SplitJson` -> `EvaluateJsonPath`. Select the **split** relationship. Right-click `EvaluateJsonPath` -> **Configure**.
 
-**Connections:** `success` → Auto-terminate 
+- **Properties Tab:**
+  - **Destination**: `flowfile-attribute`
+  - Click the `+` icon in the top right to add 4 custom properties:
+    - **Property Name**: `base`, **Value**: `$.base_currency`
+    - **Property Name**: `target`, **Value**: `$.target_currency`
+    - **Property Name**: `date`, **Value**: `$.rate_date`
+    - **Property Name**: `rate`, **Value**: `$.exchange_rate`
+- **Relationships Tab:**
+  - Auto-terminate **Failure** and **Unmatched**.
+
+Click **Apply**.
+
+---
+
+### Step 4.6: State Management (DetectDuplicate)
+
+Drag a `DetectDuplicate` processor onto the canvas. Connect `EvaluateJsonPath` -> `DetectDuplicate`. Select the **matched** relationship. Right-click `DetectDuplicate` -> **Configure**.
+
+- **Properties Tab:**
+  - **Cache Entry Identifier**: `${base}_${target}_${date}_${rate}` *(This is our composite uniqueness key)*
+  - **Distributed Cache Service**: Select the `DistributedMapCacheClientService` you created earlier.
+- **Relationships Tab:**
+  - Auto-terminate **Failure** and CRITICALLY, auto-terminate **duplicate**. This is what enforces our idempotency.
+
+Click **Apply**.
+
+---
+
+### Step 4.7: Database Load (PutDatabaseRecord)
+
+Drag a `PutDatabaseRecord` processor onto the canvas. Connect `DetectDuplicate` -> `PutDatabaseRecord`. Select the **non-duplicate** relationship. Right-click `PutDatabaseRecord` -> **Configure**.
+
+- **Properties Tab:**
+  - **Record Reader**: Select your `JsonTreeReader`.
+  - **Statement Type**: `INSERT`
+  - **Database Connection Pooling Service**: Select your `DBCPConnectionPool`.
+  - **Table Name**: `fx_rates`
+- **Relationships Tab:**
+  - Auto-terminate **Failure**, **Retry**, and **Success**.
+
+Click **Apply**.
+
+---
+
+### Step 4.8: Execution
+
+To run the pipeline, hold `Shift`, drag a box over all processors, right-click, and select **Start**.
 
 ---
 
