@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres_fx
+    environment:
+      POSTGRES_USER: nifi_user
+      POSTGRES_PASSWORD: nifi_password
+      POSTGRES_DB: fx_db
+    ports:
+      - "5432:5432"
+    networks:
+      - nifi-network
+
+  nifi:
+    image: apache/nifi:latest
+    container_name: nifi_fx
+    ports:
+      - "8443:8443" # HTTPS UI
+    environment:
+      - SINGLE_USER_CREDENTIALS_USERNAME=admin
+      - SINGLE_USER_CREDENTIALS_PASSWORD=SuperSecretPassword123!
+    networks:
+      - nifi-network
+    depends_on:
+      - postgres
+
+networks:
+  nifi-network:
+    driver: bridge
